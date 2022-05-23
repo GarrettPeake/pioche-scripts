@@ -1,0 +1,10 @@
+# dependencies
+/node_modules
+
+# misc
+/.git
+
+# Development folders and files
+.eslintignore
+.eslintrc
+.gitignore
