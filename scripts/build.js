@@ -5,6 +5,7 @@ const toml = require("@iarna/toml");
 const cwd = require("process").cwd();
 const glob = require("glob");
 const esbuild = require("esbuild");
+const { exit } = require("process");
 
 function makeTempDir(){
     if(!fs.existsSync(path.join(cwd, "piochetemp")))
@@ -132,7 +133,7 @@ async function getConfig(logger){
         if(fs.existsSync(path.join(cwd, "pioche.config.js")) ||
         fs.existsSync(path.join(cwd, "pioche.config.ts"))){
             logger.fail("Unable to parse pioche.config.js");
-            console.log(e);
+            console.error(e);
             return -1;
         }
         else
@@ -146,7 +147,7 @@ function createDefaultConfig(logger) {
         extControllers: [],
         prehandlers: [],
         posthandlers: [],
-        kv_namespaces: {},
+        kv_namespaces: {}
     };
     const contents =
         "// =================================================\n" +
@@ -251,7 +252,7 @@ async function discoverControllers(logger){
     for(const filename of files){
         logger.fgwrite("    > FILE: " + path.basename(filename), "yellow");
         const exports = await getExports(filename, logger);
-        for(const [, value] of Object.entries(exports)){
+        for(const [, value] of Object.entries(exports || {})){
             const importpath = path.relative(path.join(cwd, "src"), filename);
             checkPotentialController(value, (name) => {
                 controllers.durable_objects[name] = importpath;
@@ -340,6 +341,12 @@ async function updateWranglerToml(logger, contents, config, dotenv, controllers,
 
     // FWD: Migrations compare oldDOs and newDOs
     if(!contents.migrations) contents.migrations = [];
+    const tag = `automigrate-${contents.migrations.length + 1}`;
+    // Generate the migration
+    const migration = await migrationPrompt(logger, tag, oldDOs, newDOs);
+    if(migration){
+        contents.migrations.push(migration);
+    }
 
     // Set the build command
     contents.build = {
@@ -350,6 +357,7 @@ async function updateWranglerToml(logger, contents, config, dotenv, controllers,
 
     // Set the entry point
     contents.main = "src/entry.ts";
+    contents.tsconfig = "./tsconfig.json";
     // Set but don't override the name, workers_dev, minify, & compat date
     if(!contents.name) contents.name = path.relative(path.join(cwd, ".."), cwd);
     if(contents.workers_dev === undefined) contents.workers_dev = true;
@@ -387,6 +395,56 @@ async function updateWranglerToml(logger, contents, config, dotenv, controllers,
     logger.finish();
 }
 
+async function migrationPrompt(logger, tag, oldDO, newDO){
+    // First check if they're the same
+    const removed = oldDO?.filter((e) => !newDO?.includes(e)) || [];
+    const added = newDO?.filter((e) => !oldDO?.includes(e)) || [];
+    const renamed = []; // [{from, to}]
+    // We'll need to prompt for renames
+    if(removed.length && added.length){
+        logger.info("Durable Object changes require input");
+        const prompt = require("inquirer").prompt;
+        const ask = async (index) => {
+            return prompt([
+                {
+                    type: "list",
+                    name: "choice",
+                    message: `Rename or delete ${removed[index]}`,
+                    choices: added.concat("DELETE")
+                }
+                ]).then(a => a.choice).then(choice => {
+                    if(choice !== "DELETE"){
+                        // Remove the chosen item from added
+                        added.splice(added.indexOf(choice), 1);
+                        // Added the new entry to renamed
+                        renamed.push({from: removed[index], to: choice});
+                        // Remove the item from removed
+                        delete removed[index];
+                    }
+                });
+        };
+        for(let idx = 0; removed.length && added.length && idx < removed.length; idx++)
+            await ask(idx);
+        const conf = await prompt([{
+            type: "confirm",
+            message: "Are all above choices correct?",
+            name: "conf",
+            default: false
+        }]).then(a => a.conf);
+        if(!conf){
+            logger.fail("Exiting due to incorrect choices, restart build to fix");
+            exit(1);
+        }
+    }
+    if(added.length || removed.length || renamed.length)
+        return {
+            tag: tag,
+            new_classes: added,
+            deleted_classes: removed,
+            renamed_classes: renamed
+        };
+}
+
 function generateEntry(logger, config, controllers, extControllers, tbimports){
     logger.begin("Generating entry file");
     let contents = "";
@@ -394,6 +452,7 @@ function generateEntry(logger, config, controllers, extControllers, tbimports){
         "// ===================================================\n" +
         "// Created automatically, edits won't have any effect\n" +
         "// ===================================================\n\n" +
+        "// Required imports from pioche\n" +
         "import { DefaultHandlers, Router } from \"pioche\";\n\n";
     
     
@@ -405,20 +464,29 @@ function generateEntry(logger, config, controllers, extControllers, tbimports){
 
     // Use our compiled controller list to bring in local controllers
     contents += "// Import all discovered controllers\n" + [
-        ...Object.entries(controllers.workers),
-        ...Object.entries(controllers.durable_objects)
-    ].map(([name, loc]) => {
-        const extlen = path.extname(loc).length;
-        return `import { ${name} } from "./${loc.slice(0, loc.length - extlen)}"`;
-    }).join(";\n") + ";\n\n";
+            ...Object.entries(controllers.workers),
+            ...Object.entries(controllers.durable_objects)
+        ].map(([name, loc]) => {
+            const extlen = path.extname(loc).length;
+            return `import { ${name} } from "./${loc.slice(0, loc.length - extlen)}"`;
+        }).join(";\n") + ";\n\n";
+
+    // Exporting all Durable Objects
+    contents += "// Export DurableObjectControllers\n" + 
+        "export { " + [
+        ...Object.entries(controllers.durable_objects).map(([n])=>n),
+        ...extControllers.durable_objects
+    ].join(", ") + " };\n\n";
+
 
     // List all controllers to avoid tree shaking
-    contents += "// Listing controllers prevents them from being tree-shaken\n" + [
-        ...Object.entries(controllers.workers).map(([n])=>n),
-        ...Object.entries(controllers.durable_objects).map(([n])=>n),
-        ...extControllers.workers,
-        ...extControllers.durable_objects
-    ].join(";\n") + ";\n\n";
+    contents += "// Prevent tree shaking and map to preminified names\n" +
+        "Router.setBindings([\n" + [
+            ...Object.entries(controllers.workers).map(([n])=>n),
+            ...Object.entries(controllers.durable_objects).map(([n])=>n),
+            ...extControllers.workers,
+            ...extControllers.durable_objects
+        ].map(c => `    [${c}, "${c}"]`).join(",\n") + "\n]);\n\n";
 
     // Router.useBefore all of the prehandlers
     if(config.prehandlers.length){
@@ -461,7 +529,8 @@ async function getExports(filename, logger){
         exports = await import(path.join(cwd, "piochetemp/temp.mjs"));
         logger.fglog(" > success", "green");
     } catch (e) {
-        logger.fglog(" > failed", "red");
+        logger.fglog(" > failed", "red\n");
+        console.error(e);
         try{
             // Try to require it
             // This will succeed on .js/.jsx CJS modules
@@ -469,8 +538,8 @@ async function getExports(filename, logger){
             exports = require(path.join(cwd, "piochetemp/temp.mjs"));
             logger.fglog(" > success", "green");
         } catch (e1) {
-            console.log(e);
-            logger.fglog(" > failed", "red");
+            logger.fglog(" > failed", "red\n");
+            console.error(e);
         }
     }
     return exports;
