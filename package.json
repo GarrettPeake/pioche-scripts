@@ -1,6 +1,6 @@
 {
   "name": "pioche-scripts",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Garrett Peake",
   "description": "A set of scripts for the pioche CF Workers Framework",
   "main": "index.js",
